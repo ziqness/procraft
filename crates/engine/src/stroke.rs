@@ -310,6 +310,13 @@ const SLOW: f32 = 25.0;
 const SPAN: f32 = 100.0;
 /// How many frames the speed is smoothed over.
 const SPEED_FRAMES: f32 = 3.0;
+/// The start of the keys the Speed dynamics plugin (`speed-dynamics.procraft-plugin`) keeps with a
+/// brush for its rows in the brush studio's Properties: `plugin:<id>:<key>`, as the choice's place
+/// (0 for the first). Its `sensibilidad` row makes the speed dynamics that many times more
+/// sensitive (by `SPEED_TIMES`, a place each), and its `estilo` row reads the speed sliders as
+/// ibisPaint's do (a minus thins with speed, a plus thickens) rather than as Procraft's.
+const SPEED_PLUGIN: &str = "plugin:user.speed-dynamics:";
+const SPEED_TIMES: [f32; 11] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0, 12.0, 15.0, 20.0];
 /// The frames between two samples with the same time: a sample's at the input's rate (60 over
 /// the points a second, a pen's 240 and a finger's 120).
 fn sample_frames(pen: bool) -> f32 {
@@ -441,6 +448,8 @@ struct Extras {
     speed_size: f32,
     speed_opacity: f32,
     speed_spacing: f32,
+    /// How many times more than usual input counts as fast, less one (0: as usual).
+    speed_more: f32,
     stabilization: f32,
     flip_x: bool,
     flip_y: bool,
@@ -536,6 +545,9 @@ impl Extras {
     fn of(b: &Brush) -> Extras {
         let unit = |k: &str| b.setting(k).clamp(0.0, 1.0);
         let both = |k: &str| b.setting(k).clamp(-1.0, 1.0);
+        // the Speed dynamics plugin's rows
+        let row = |k: &str| b.setting(&format!("{}{}", SPEED_PLUGIN, k)).round().max(0.0);
+        let speed_sign = if row("estilo") >= 1.0 { -1.0 } else { 1.0 };
         let switch = |k: &str| (b.setting(k) >= 0.5).then(|| unit(&format!("{k}_angle")));
         Extras {
             spacing_jitter: unit("spacing_jitter"),
@@ -546,9 +558,10 @@ impl Extras {
             pressure_roundness: both("pressure_roundness"),
             tilt_roundness: both("tilt_roundness"),
             roundness_jitter: [unit("roundness_jitter_y"), unit("roundness_jitter_x")],
-            speed_size: both("speed_size"),
-            speed_opacity: both("speed_opacity"),
+            speed_size: speed_sign * both("speed_size"),
+            speed_opacity: speed_sign * both("speed_opacity"),
             speed_spacing: unit("speed_spacing"),
+            speed_more: SPEED_TIMES.get(row("sensibilidad") as usize).map_or(0.0, |times| times - 1.0),
             stabilization: unit("stabilization"),
             flip_x: unit("flip_x") >= 0.5,
             flip_y: unit("flip_y") >= 0.5,
@@ -1002,8 +1015,6 @@ pub struct StrokeBuilder {
     exact: bool,
     /// Drawn on the studio's pad, and whether the brush previews tilt there.
     pad: Option<bool>,
-    /// The samples say nothing of how the pen is turned (the library's sample stroke).
-    no_azimuth: bool,
     /// A gap drawn that the last input segment ended before reaching: the next one goes on
     /// with it.
     pending_gap: Option<f32>,
@@ -1217,13 +1228,6 @@ impl StrokeBuilder {
         self
     }
 
-    /// The samples say nothing of how the pen is turned (the library's sample stroke): a brush
-    /// whose stamps turn as the pen is held turns them with the stroke instead, as under a finger.
-    pub fn without_azimuth(mut self) -> StrokeBuilder {
-        self.no_azimuth = true;
-        self
-    }
-
     pub fn exact_path(mut self) -> StrokeBuilder {
         self.exact = true;
         self
@@ -1338,7 +1342,6 @@ impl StrokeBuilder {
             steady: false,
             exact: false,
             pad: None,
-            no_azimuth: false,
             pending_gap: None,
             stroke_shift: Tint::NONE,
             stroke_secondary: 0.0,
@@ -1526,13 +1529,6 @@ impl StrokeBuilder {
     /// longer reaches, and the tip, the stamps after them as they would be drawn were the stroke
     /// to end here.
     pub fn add_tipped(&mut self, samples: &[Sample]) -> (Vec<Stamp>, Vec<Stamp>) {
-        let kept = self.add_kept(samples);
-        (kept, self.tip_now())
-    }
-
-    /// The first half of [`StrokeBuilder::add_tipped`]: the stamps to draw for good now, the tip
-    /// left to [`StrokeBuilder::tip_now`] (or [`StrokeBuilder::preview_tip`]) when it is wanted.
-    pub fn add_kept(&mut self, samples: &[Sample]) -> Vec<Stamp> {
         self.add(samples);
         let start = self.start_span();
         let reach = match self.start_settled {
@@ -1549,16 +1545,11 @@ impl StrokeBuilder {
         let kept = self.placed.get(self.kept..to).unwrap_or_default();
         let kept = kept.iter().map(|p| self.finish_stamp(p, start, None)).collect();
         self.kept = to;
-        kept
-    }
-
-    /// The tip of a stroke shown with its tip, as if it ended here: the stamps after those drawn
-    /// for good, walked on to the input.
-    pub fn tip_now(&mut self) -> Vec<Stamp> {
-        let mut ended = self.open_copy(self.kept);
+        // the tip as if the stroke ended here: walked on to the input
+        let mut ended = self.open_copy(to);
         ended.reach_input(&mut Vec::new());
         ended.respace_tip();
-        ended.tip_from(0)
+        (kept, ended.tip_from(0))
     }
 
     /// The tip as it would be with `samples` added (for drawing predicted input), the stroke
@@ -1905,7 +1896,7 @@ impl StrokeBuilder {
         });
         if let Some((moved, frames)) = gone {
             let moved = moved * self.points_per_pixel / frames;
-            let scale = self.input.speed_distance.clamp(0.25, 1.0);
+            let scale = (self.input.speed_distance.clamp(0.25, 1.0) / (1.0 + self.extras.speed_more)).clamp(0.05, 1.0);
             let over = (moved - SLOW * scale) / (SPAN * scale);
             let now = if over > 0.0 && !self.steady { over.sqrt().min(1.0) } else { 0.0 };
             // the first move as it is; later ones smoothed over a few frames
@@ -2273,13 +2264,8 @@ impl StrokeBuilder {
     /// How far stamps turn with the stroke: a pen turns them as it is held (its azimuth) in place
     /// of following the stroke, which is for touch.
     fn follow(&self) -> f32 {
-        if self.turned_by_pen() { 0.0 } else { self.brush.shape.follow }
-    }
-
-    /// The stamps turn as the pen is held, not with the stroke: a brush that says so, under a pen
-    /// that tells how it is turned.
-    fn turned_by_pen(&self) -> bool {
-        self.brush.shape.follow_azimuth && self.pointer.has_pressure() && !self.no_azimuth
+        let held = self.brush.shape.follow_azimuth && self.pointer.has_pressure();
+        if held { 0.0 } else { self.brush.shape.follow }
     }
 
     fn classic(&self) -> bool {
@@ -2910,7 +2896,7 @@ impl StrokeBuilder {
             }
             let turned = self.stroke_turn - self.screen_turn + follow * self.direction;
             let mut own = shape.rotation;
-            if shape.follow_azimuth && !self.no_azimuth {
+            if shape.follow_azimuth {
                 own += p.azimuth;
             }
             if let Some(from) = self.roll_from {
@@ -2988,7 +2974,7 @@ impl StrokeBuilder {
             // the patch read takes the rotation control's share of the stamp's whole turn, which
             // counts from an eighth of a turn, from a pen's lean the other way (kept to the
             // screen, the grain is too)
-            let held = if self.turned_by_pen() { std::f32::consts::PI } else { 0.0 };
+            let held = if shape.follow_azimuth && self.pointer.has_pressure() { std::f32::consts::PI } else { 0.0 };
             let from_eighth = wrapped(std::f32::consts::FRAC_PI_4 + turned) + own - held;
             let grain_turn = x.grain_rotation * from_eighth + self.screen_turn;
             let placed = Placed {
@@ -5198,38 +5184,6 @@ mod tests {
         assert!((angle(Pointer::Stylus, 0.0) - 0.3).abs() < 1e-4, "{}", angle(Pointer::Stylus, 0.0));
         assert!((angle(Pointer::Finger, 0.0) - quarter).abs() < 1e-4, "{}", angle(Pointer::Finger, 0.0));
         assert!((angle(Pointer::Stylus, 1.0) - 0.3).abs() < 1e-4, "{}", angle(Pointer::Stylus, 1.0));
-    }
-
-    /// The library's sample stroke tells no pen's turn: a brush turned as the pen is held turns its
-    /// stamps along the stroke there, as a finger does, each stamp with the stroke's way where it is.
-    #[test]
-    fn a_sample_stroke_without_the_pen_s_turn_turns_stamps_along_its_way() {
-        let angles = |azimuth: bool, follow: f32| {
-            let mut b = plain();
-            b.set_setting("shape_rotation", follow);
-            b.set_setting("input_style", if azimuth { 1.0 } else { 0.0 });
-            // a quarter circle from heading right to heading down, the pen held turned 0.3 radians
-            let at = |i: u32| {
-                let a = i as f32 / 20.0 * std::f32::consts::FRAC_PI_2;
-                let p = Vec2::new(200.0 * a.sin(), 200.0 * (1.0 - a.cos()));
-                Sample { azimuth: 0.3, ..Sample::at(p, 1.0, f64::from(i) * 4.0) }
-            };
-            let samples: Vec<Sample> = (0..=20).map(at).collect();
-            // the stroke as it ends, its first stamps turned to the way it went
-            let mut stroke = StrokeBuilder::new(b, 10.0, Pointer::Stylus).steady().on_pad(false).without_azimuth();
-            stroke.add(&samples);
-            let stamps = stroke.finish();
-            (stamps.first().map_or(f32::NAN, |s| s.angle), stamps.last().map_or(f32::NAN, |s| s.angle))
-        };
-        let quarter = std::f32::consts::FRAC_PI_2;
-        for azimuth in [true, false] {
-            let (first, last) = angles(azimuth, 1.0);
-            assert!(first.abs() < 0.2, "azimuth {azimuth}: the first stamp heads right, {first}");
-            assert!((last - quarter).abs() < 0.2, "azimuth {azimuth}: the last heads down, {last}");
-        }
-        // a fixed one stays as it is set, the pen's turn not added
-        let (first, last) = angles(true, 0.0);
-        assert!(first.abs() < 1e-4 && last.abs() < 1e-4, "{first} {last}");
     }
 
     #[test]
